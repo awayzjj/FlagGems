@@ -829,3 +829,25 @@ def test_accuracy_diag(shape, diagonal, dtype):
     with flag_gems.use_gems():
         res_out = torch.diag(inp, diagonal)
     gems_assert_equal(res_out, ref_out)
+
+
+@pytest.mark.diagonal
+@pytest.mark.parametrize("shape", [(1024, 1), (1024, 1024), (512, 1024), (798, 798)])
+@pytest.mark.parametrize("dtype", FLOAT_DTYPES)
+def test_accuracy_diagonal(shape, dtype):
+    inp = torch.randn(shape, dtype=dtype, device="cuda", requires_grad=True)
+    ref_inp = to_reference(inp)
+
+    ref_out = torch.diagonal(inp)
+    # with flag_gems.use_gems():
+    #    res_out = torch.diagonal(inp)
+    res_out = flag_gems.ops.diagonal(inp)
+    gems_assert_equal(res_out, ref_out)
+
+    out_grad = torch.randn_like(res_out)
+    ref_grad = to_reference(out_grad)
+
+    (ref_in_grad,) = torch.autograd.grad(ref_out, ref_inp, ref_grad)
+    (res_in_grad,) = torch.autograd.grad(res_out, inp, out_grad)
+
+    gems_assert_close(res_in_grad, ref_in_grad, dtype)
