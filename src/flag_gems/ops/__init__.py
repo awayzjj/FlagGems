@@ -18,6 +18,7 @@ from .cat import cat
 from .clamp import clamp, clamp_tensor
 from .cos import cos
 from .cross_entropy_loss import cross_entropy_loss
+from .cummin import cummin
 from .cumsum import cumsum, normed_cumsum
 from .diag import diag
 from .div import div_mode, floor_divide, remainder, true_divide
@@ -137,6 +138,7 @@ __all__ = [
     "cos",
     "diag",
     "pad",
+    "cummin",
     "cumsum",
     "normed_cumsum",
     "true_divide",
