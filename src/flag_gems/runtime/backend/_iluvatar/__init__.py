@@ -8,11 +8,11 @@ vendor_info = VendorInfoBase(
 
 
 def get_register_op_config():
-    return (("add.Tensor", add, Autograd.disable),)
+    return ()
 
 
 def get_unused_op():
-    return ("cumsum", "cos")
+    return ()
 
 
 __all__ = ["*"]
