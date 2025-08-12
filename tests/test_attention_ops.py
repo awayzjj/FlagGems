@@ -188,15 +188,22 @@ def torch_sdpa(q, k, v, scale, is_causal, enable_gqa=False):
             is_causal=is_causal,
         )
     else:
-        torch_result = torch.nn.functional.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            scale=scale,
-            is_causal=is_causal,
-            enable_gqa=enable_gqa,
-        )
+        if flag_gems.vendor_name == "iluvatar" and TO_CPU:
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+            ctx = sdpa_kernel(backends=[SDPBackend.MATH])
+        else:
+            from contextlib import nullcontext
+            ctx = nullcontext()
+        with ctx:
+            torch_result = torch.nn.functional.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                scale=scale,
+                is_causal=is_causal,
+                enable_gqa=enable_gqa,
+            )
     return torch_result
 
 
