@@ -365,6 +365,11 @@ _FULL_CONFIG = (
     ("zeros_like", zeros_like),
 )
 
+_FULL_CONFIG = (
+    ("mm", mm),
+    ("mm.out", mm_out),
+)
+
 # Cache mapping from function name -> list of _FULL_CONFIG entries for quick lookup
 FULL_CONFIG_BY_FUNC = {}
 for _item in _FULL_CONFIG:
