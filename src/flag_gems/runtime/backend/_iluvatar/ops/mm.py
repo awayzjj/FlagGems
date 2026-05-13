@@ -33,6 +33,33 @@ def _to_tl_type(ty):
     return getattr(tl, str(ty).split(".")[-1])
 
 
+@libentry()
+@libtuner(
+    configs=runtime.get_tuned_config("mm"),
+    key=["M", "N", "K"],
+    prune_configs_by={
+        "early_config_prune": early_config_prune,
+        "perf_model": estimate_matmul_time,
+        "top_k": 15,
+    },
+    warmup=5,
+    rep=10,
+)
+@triton.heuristics(
+    {
+        "EVEN_K": lambda args: args["K"] % (args["BLOCK_K"] * args["SPLIT_K"]) == 0,
+        "UPGRADE": lambda args: math.ceil(
+            (args["M"] * args["N"]) / (args["BLOCK_M"] * args["BLOCK_N"])
+        ).bit_length()
+        > 31,
+        "UPGRADE_A_OFFS": lambda args: math.ceil(args["M"] * args["K"]).bit_length()
+        > 31,
+        "UPGRADE_B_OFFS": lambda args: math.ceil(args["K"] * args["N"]).bit_length()
+        > 31,
+        "UPGRADE_C_OFFS": lambda args: math.ceil(args["M"] * args["N"]).bit_length()
+        > 31,
+    }
+)
 @triton.jit
 def mm_kernel(
     A,
@@ -47,38 +74,132 @@ def mm_kernel(
     stride_bn,
     stride_cm,
     stride_cn,
+    acc_dtype: tl.constexpr,
+    input_precision: tl.constexpr,
+    fp8_fast_accum: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    AB_DTYPE: tl.constexpr,
+    UPGRADE: tl.constexpr,
+    UPGRADE_A_OFFS: tl.constexpr,
+    UPGRADE_B_OFFS: tl.constexpr,
+    UPGRADE_C_OFFS: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
-    a_ptrs = A + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-    b_ptrs = B + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
-        k_left = K - k * BLOCK_K
-        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_left)
-        b_mask = (offs_k[:, None] < k_left) & (offs_n[None, :] < N)
-        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
-        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
-        acc += tl.dot(a, b)
-        a_ptrs += BLOCK_K * stride_ak
-        b_ptrs += BLOCK_K * stride_bk
-    c_ptrs = C + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    tl.store(c_ptrs, acc.to(C.dtype.element_ty), mask=c_mask)
+    # matrix multiplication
+    if UPGRADE:
+        pid = tle.program_id(0)
+        pid_z = tle.program_id(1)
+    else:
+        pid = tl.program_id(0)
+        pid_z = tl.program_id(1)
+    # grid_m = tl.cdiv(M, BLOCK_M)
+    grid_n = tl.cdiv(N, BLOCK_N)
+    # # re-order program ID for better L2 performance
+    # width = GROUP_M * grid_n
+    # group_id = pid // width
+    # group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+    # pid_m = group_id * GROUP_M + (pid % group_size)
+    # pid_n = (pid % width) // (group_size)
+    pid_m = pid // grid_n
+    pid_n = pid % grid_n
+    # do matrix multiplication
+    if UPGRADE_A_OFFS:
+        rm = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
+        ram = (tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)).to(tl.int64)
+    else:
+        rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
+    if UPGRADE_B_OFFS:
+        rn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)).to(tl.int64)
+        rbn = (tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)).to(tl.int64)
+    else:
+        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+    rk = pid_z * BLOCK_K + tl.arange(0, BLOCK_K)
+    # pointers
+    A = A + (ram[:, None] * stride_am + rk[None, :] * stride_ak)
+    B = B + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=acc_dtype)
+    if EVEN_K:
+        for k in range(0, tl.cdiv(K, BLOCK_K * SPLIT_K)):
+            a = tl.load(A)
+            b = tl.load(B)
+            if AB_DTYPE is not None:
+                a = a.to(AB_DTYPE)
+                b = b.to(AB_DTYPE)
+            if fp8_fast_accum:
+                acc = tl.dot(
+                    a, b, acc, out_dtype=acc_dtype, input_precision=input_precision
+                )
+            else:
+                acc += tl.dot(
+                    a, b, out_dtype=acc_dtype, input_precision=input_precision
+                )
+            A += BLOCK_K * SPLIT_K * stride_ak
+            B += BLOCK_K * SPLIT_K * stride_bk
+    else:
+        loop_num = tl.cdiv(K, BLOCK_K * SPLIT_K) - 1
+        for k in range(0, loop_num):
+            a = tl.load(A)
+            b = tl.load(B)
+            if AB_DTYPE is not None:
+                a = a.to(AB_DTYPE)
+                b = b.to(AB_DTYPE)
+            if fp8_fast_accum:
+                acc = tl.dot(
+                    a, b, acc, out_dtype=acc_dtype, input_precision=input_precision
+                )
+            else:
+                acc += tl.dot(
+                    a, b, out_dtype=acc_dtype, input_precision=input_precision
+                )
+            A += BLOCK_K * SPLIT_K * stride_ak
+            B += BLOCK_K * SPLIT_K * stride_bk
+
+        _0 = tl.zeros((1, 1), dtype=C.dtype.element_ty)
+        k_remaining = K - loop_num * (BLOCK_K * SPLIT_K)
+        a = tl.load(A, mask=rk[None, :] < k_remaining, other=_0)
+        b = tl.load(B, mask=rk[:, None] < k_remaining, other=_0)
+        if fp8_fast_accum:
+            acc = tl.dot(
+                a, b, acc, out_dtype=acc_dtype, input_precision=input_precision
+            )
+        else:
+            acc += tl.dot(a, b, out_dtype=acc_dtype, input_precision=input_precision)
+
+    acc = acc.to(C.dtype.element_ty)
+    # rematerialize rm and rn to save registers
+    if UPGRADE_C_OFFS:
+        rm = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
+        rn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)).to(tl.int64)
+        C = C + (rm[:, None] * stride_cm + rn[None, :] * stride_cn).to(tl.int64)
+    else:
+        rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        C = C + (rm[:, None] * stride_cm + rn[None, :] * stride_cn)
+    mask = (rm < M)[:, None] & (rn < N)[None, :]
+    # handles write-back with reduction-splitting
+    if SPLIT_K == 1:
+        tl.store(C, acc, mask=mask)
+    else:
+        tl.atomic_add(C, acc, mask=mask)
+
 
 def _launch_mm(a, b, c, M, N, K):
-    BLOCK_M = 32
-    BLOCK_N = 32
-    BLOCK_M = 16
-    BLOCK_N = 16
-    BLOCK_K = 32
-    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    """Launch Triton matmul _kernel; c must be pre-allocated."""
+    ab_dtype = get_higher_dtype(a.dtype, b.dtype)
+    acc_dtype_tl = tl.float32
+    ab_dtype_tl = _to_tl_type(ab_dtype)
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
+        META["SPLIT_K"],
+    )
+
     with torch_device_fn.device(a.device):
         mm_kernel[grid](
             a,
@@ -93,11 +214,11 @@ def _launch_mm(a, b, c, M, N, K):
             b.stride(1),
             c.stride(0),
             c.stride(1),
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            BLOCK_K=BLOCK_K,
-            num_warps=4,
-            num_stages=1,
+            acc_dtype=acc_dtype_tl,
+            input_precision=None,
+            fp8_fast_accum=True,
+            GROUP_M=8,
+            AB_DTYPE=ab_dtype_tl,
         )
     return c
 
