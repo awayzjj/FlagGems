@@ -24,55 +24,43 @@ from flag_gems.utils import broadcastable_to, libentry
 
 logger = logging.getLogger(__name__)
 
+_DTYPE_CONFIGS = {
+    torch.float16: {
+        "BLOCK_SIZE_M": 256,
+        "BLOCK_SIZE_N": 256,
+        "BLOCK_SIZE_K": 32,
+        "num_warps": 16,
+        "num_stages": 2,
+    },
+    torch.bfloat16: {
+        "BLOCK_SIZE_M": 256,
+        "BLOCK_SIZE_N": 256,
+        "BLOCK_SIZE_K": 32,
+        "num_warps": 16,
+        "num_stages": 2,
+    },
+    torch.float32: {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 32,
+        "num_warps": 8,
+        "num_stages": 2,
+    },
+}
 
-def _matmul_bias_activation_configs():
-    configs = []
-    for block_m, block_n, block_k, warps, stages in [
-        # Large tiles (match mm's big-shape winners)
-        (256, 256, 64, 16, 2),
-        (256, 256, 32, 16, 2),
-        (256, 256, 32, 8, 2),
-        (256, 128, 64, 16, 2),
-        (256, 128, 32, 16, 2),
-        (256, 128, 32, 8, 2),  # mm's best on 1024
-        (128, 256, 64, 16, 2),
-        (128, 256, 32, 16, 2),
-        (128, 256, 32, 8, 2),
-        # Mid tiles
-        (128, 128, 64, 8, 2),
-        (128, 128, 32, 8, 2),
-        (128, 64, 32, 8, 2),
-        (64, 128, 32, 8, 2),
-        # Small tiles (match mm's best on 384)
-        (64, 64, 64, 8, 2),
-        (64, 64, 32, 8, 2),
-        (64, 64, 32, 4, 2),
-        # stages=1 variants that mm also searches
-        (256, 256, 32, 16, 1),
-        (256, 128, 32, 8, 1),
-        (64, 64, 64, 8, 1),
-    ]:
-        configs.append(
-            triton.Config(
-                {
-                    "BLOCK_SIZE_M": block_m,
-                    "BLOCK_SIZE_N": block_n,
-                    "BLOCK_SIZE_K": block_k,
-                },
-                num_warps=warps,
-                num_stages=stages,
-            )
-        )
-    return configs
+
+def _mba_config(args):
+    return _DTYPE_CONFIGS.get(args["a_ptr"].dtype, _DTYPE_CONFIGS[torch.float16])
 
 
 @libentry()
-@triton.autotune(
-    configs=_matmul_bias_activation_configs(),
-    key=["M", "N", "K"],
-)
 @triton.heuristics(
     {
+        "BLOCK_SIZE_M": lambda args: _mba_config(args)["BLOCK_SIZE_M"],
+        "BLOCK_SIZE_N": lambda args: _mba_config(args)["BLOCK_SIZE_N"],
+        "BLOCK_SIZE_K": lambda args: _mba_config(args)["BLOCK_SIZE_K"],
+        "num_warps": lambda args: _mba_config(args)["num_warps"],
+        "num_stages": lambda args: _mba_config(args)["num_stages"],
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
     }
 )
