@@ -25,12 +25,57 @@ from flag_gems.utils import broadcastable_to, libentry
 logger = logging.getLogger(__name__)
 
 
-BLOCK_SIZE_M = 128
-BLOCK_SIZE_N = 128
-BLOCK_SIZE_K = 32
+def _matmul_bias_activation_configs():
+    configs = []
+    for block_m, block_n, block_k, warps, stages in [
+        # Large tiles (match mm's big-shape winners)
+        (256, 256, 64, 16, 2),
+        (256, 256, 32, 16, 2),
+        (256, 256, 32, 8, 2),
+        (256, 128, 64, 16, 2),
+        (256, 128, 32, 16, 2),
+        (256, 128, 32, 8, 2),  # mm's best on 1024
+        (128, 256, 64, 16, 2),
+        (128, 256, 32, 16, 2),
+        (128, 256, 32, 8, 2),
+        # Mid tiles
+        (128, 128, 64, 8, 2),
+        (128, 128, 32, 8, 2),
+        (128, 64, 32, 8, 2),
+        (64, 128, 32, 8, 2),
+        # Small tiles (match mm's best on 384)
+        (64, 64, 64, 8, 2),
+        (64, 64, 32, 8, 2),
+        (64, 64, 32, 4, 2),
+        # stages=1 variants that mm also searches
+        (256, 256, 32, 16, 1),
+        (256, 128, 32, 8, 1),
+        (64, 64, 64, 8, 1),
+    ]:
+        configs.append(
+            triton.Config(
+                {
+                    "BLOCK_SIZE_M": block_m,
+                    "BLOCK_SIZE_N": block_n,
+                    "BLOCK_SIZE_K": block_k,
+                },
+                num_warps=warps,
+                num_stages=stages,
+            )
+        )
+    return configs
 
 
 @libentry()
+@triton.autotune(
+    configs=_matmul_bias_activation_configs(),
+    key=["M", "N", "K"],
+)
+@triton.heuristics(
+    {
+        "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
+    }
+)
 @triton.jit
 def matmul_bias_activation_kernel(
     a_ptr,
@@ -50,38 +95,49 @@ def matmul_bias_activation_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    EVEN_K: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid = tl.program_id(0)
+    grid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    pid_m = pid // grid_n
+    pid_n = pid % grid_n
 
     offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+    # Wrap M/N indices so full-tile loads can omit masks without OOB
+    ram = tl.max_contiguous(tl.multiple_of(offs_am % M, BLOCK_SIZE_M), BLOCK_SIZE_M)
+    rbn = tl.max_contiguous(tl.multiple_of(offs_bn % N, BLOCK_SIZE_N), BLOCK_SIZE_N)
+    a_ptrs = a_ptr + (ram[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + rbn[None, :] * stride_bn)
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a = tl.load(
-            a_ptrs,
-            mask=(offs_am[:, None] < M) & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
-            other=0.0,
-        )
-        b = tl.load(
-            b_ptrs,
-            mask=(offs_k[:, None] < K - k * BLOCK_SIZE_K) & (offs_bn[None, :] < N),
-            other=0.0,
-        )
-        accumulator += tl.dot(a, b, allow_tf32=False)
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
+    if EVEN_K:
+        for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+            a = tl.load(a_ptrs)
+            b = tl.load(b_ptrs)
+            accumulator += tl.dot(a, b, allow_tf32=False)
+            a_ptrs += BLOCK_SIZE_K * stride_ak
+            b_ptrs += BLOCK_SIZE_K * stride_bk
+    else:
+        # Only the last (partial) K tile needs a mask
+        loop_num = tl.cdiv(K, BLOCK_SIZE_K) - 1
+        for k in range(0, loop_num):
+            a = tl.load(a_ptrs)
+            b = tl.load(b_ptrs)
+            accumulator += tl.dot(a, b, allow_tf32=False)
+            a_ptrs += BLOCK_SIZE_K * stride_ak
+            b_ptrs += BLOCK_SIZE_K * stride_bk
 
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    bias_ptrs = bias_ptr + offs_cn * stride_bias
-    bias = tl.load(bias_ptrs, mask=offs_cn < N, other=0.0)
+        k_remaining = K - loop_num * BLOCK_SIZE_K
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < k_remaining, other=0.0)
+        accumulator += tl.dot(a, b, allow_tf32=False)
+
+    c_ptrs = c_ptr + stride_cm * offs_am[:, None] + stride_cn * offs_bn[None, :]
+    c_mask = (offs_am[:, None] < M) & (offs_bn[None, :] < N)
+    bias_ptrs = bias_ptr + offs_bn * stride_bias
+    bias = tl.load(bias_ptrs, mask=offs_bn < N, other=0.0)
     accumulator = accumulator + bias[None, :]
 
     # Apply ReLU activation
@@ -120,8 +176,7 @@ def matmul_bias_activation(input, weight, bias):
     out = torch.empty((M, N), device=input.device, dtype=input.dtype)
 
     grid = lambda META: (
-        triton.cdiv(M, META["BLOCK_SIZE_M"]),
-        triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
     with torch_device_fn.device(input.device):
         matmul_bias_activation_kernel[grid](
@@ -139,8 +194,5 @@ def matmul_bias_activation(input, weight, bias):
             bias.stride(0),
             out.stride(0),
             out.stride(1),
-            BLOCK_SIZE_M,
-            BLOCK_SIZE_N,
-            BLOCK_SIZE_K,
         )
     return out
