@@ -915,6 +915,7 @@ from flag_gems.ops.one_hot import one_hot
 from flag_gems.ops.ones import ones
 from flag_gems.ops.ones_like import ones_like
 from flag_gems.ops.or_scalar import or_scalar
+from flag_gems.ops.or_tensor import or_tensor
 from flag_gems.ops.orgqr import orgqr, orgqr_out
 from flag_gems.ops.ormqr import ormqr
 from flag_gems.ops.pad import constant_pad_nd, pad
@@ -2275,6 +2276,7 @@ __all__ = [
     "ones",
     "ones_like",
     "or_scalar",
+    "or_tensor",
     "orgqr",
     "orgqr_out",
     "ormqr",
