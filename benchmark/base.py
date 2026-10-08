@@ -59,6 +59,14 @@ else:
         pass
 
 
+# do_bench flushes the L2 cache with `cache.zero_()` before every timed
+# iteration. Routing that flush through Gems costs ~0.07ms more host time per
+# iteration, which lands in the reported latency of any op that synchronizes
+# internally while the torch baseline. Excluding `zero_` alone is not enough:
+# native `zero_` re-dispatches to `fill_.Scalar`.
+CACHE_FLUSH_OPS = ("zero_", "fill_scalar_", "fill_tensor_")
+
+
 def get_iter_count(fn):
     if Config.mode == consts.BenchMode.OPERATOR:
         torch_device_fn.synchronize()
@@ -573,7 +581,7 @@ class Benchmark:
             nullcontext()
             if override is not None or self.gems_op
             else flag_gems.use_gems(
-                exclude=[] if self.op_name == "zero_" else ["zero_"]
+                exclude=[op for op in CACHE_FLUSH_OPS if op != self.op_name]
             )
         )
         return op, dispatch, override is not None
